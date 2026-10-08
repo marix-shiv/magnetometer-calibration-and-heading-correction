@@ -1,122 +1,113 @@
 # Tilt-Compensated Magnetometer Heading
 
-Practical magnetometer calibration and tilt-compensated heading correction for robotic platforms using **3D hard/soft-iron calibration**, **error analysis**, and an **empirical magnetic-state lookup table (LUT)**.
+A practical robotics project for **3D magnetometer calibration**, **tilt-induced heading error analysis**, and **heading compensation on a pitching platform**.
 
-> **Goal:** if physical yaw is fixed, the reported heading should remain approximately constant while the sensor platform pitches.
+The system was developed for a two-axis mechanism with approximately:
 
----
+- **Yaw:** `0° to 360°`
+- **Pitch:** `-40° to +40°`
 
-## Why this project exists
+The problem was straightforward:
 
-A normal magnetic heading is usually calculated as:
+> **When physical yaw is fixed, changing pitch should not change the reported heading.**
 
-```python
-heading = atan2(My, Mx)
-```
+At a physical yaw of approximately `90°`, the calibrated magnetometer could report roughly:
 
-That works well when the magnetometer is close to level. On our pitching platform, however, the same physical yaw produced very different headings as pitch changed.
+| Pitch | Measured heading |
+|---:|---:|
+| `-40°` | `~70°` |
+| `0°` | `~90°` |
+| `+40°` | `~111°` |
 
-One representative test at a physical yaw of about `90°` was:
+The magnetometer was already hard/soft-iron calibrated, so this was not just a basic calibration problem. The remaining error was caused by the changing orientation of the magnetic-field vector relative to the sensor frame.
 
-| Physical yaw | Pitch | Calibrated magnetic heading |
-|---:|---:|---:|
-| 90° | -40° | ~70° |
-| 90° | 0° | ~90° |
-| 90° | +40° | ~111° |
-
-The magnetometer was already hard/soft-iron calibrated, so the remaining problem was not simply an uncalibrated sensor. The Earth's magnetic-field vector is projected differently into the sensor frame when the platform tilts.
+This repository documents the approaches we tested, the calibration mathematics, the reusable Python implementation, and the current direction toward full AHRS sensor fusion.
 
 ---
 
-## Project status
-
-- [x] UART sensor acquisition
-- [x] 3D hard-iron calibration
-- [x] 3D soft-iron calibration
-- [x] Calibration-quality analysis
-- [x] Pitch-induced heading-error characterization
-- [x] Magnetometer-state LUT prototype
-- [x] Live validation
-- [x] Nearest-cell vs interpolation experiment
-- [ ] Rebuild LUT using known physical yaw as ground truth
-- [ ] Verify final IMU firmware/scaling against installed hardware
-- [ ] Gyroscope and accelerometer calibration
-- [ ] AHRS comparison using Madgwick / Mahony / Fusion
-- [ ] Dynamic-motion validation
-
----
-
-# 1. System architecture
+## Overview
 
 ```mermaid
-flowchart TD
-    A[3-axis Magnetometer] --> B[Teensy]
-    B --> C[UART binary packets]
-    C --> D[Python Receiver]
-    D --> E[Hard-Iron Correction]
-    E --> F[Soft-Iron Correction]
-    F --> G[Calibrated Mx My Mz]
-    G --> H[Base Magnetic Heading]
-    G --> I[Magnetic Vector Elevation]
-    H --> J[Magnetic-State LUT]
-    I --> J
-    J --> K[Final Corrected Heading]
+flowchart LR
+    A[Raw Magnetometer XYZ] --> B[3D Hard-Iron / Soft-Iron Calibration]
+    B --> C[Calibrated Magnetic Vector]
+    C --> D[Base Heading]
+    C --> E[Magnetic Vector Elevation]
+    D --> F[Heading Compensation]
+    E --> F
+    F --> G[Corrected Heading 0-360 deg]
 ```
 
-Our newer hardware notes identify the board as a **Pololu AltIMU-10 v6**. Some earlier firmware experiments referenced older sensor ICs, so raw-count scale factors and register settings should be verified against the exact firmware and installed board before reuse.
-
----
-
-# 2. Add real project photos
-
-Create these files when you upload the real images:
+The work progressed through three practical compensation approaches:
 
 ```text
-docs/images/platform_overview.jpg
-docs/images/imu_mount.jpg
-docs/images/calibration_motion.jpg
-docs/images/raw_vs_calibrated.png
-docs/images/heading_vs_pitch.png
-```
+1. Magnetometer-state LUT
+2. Encoder-based tilt compensation
+3. IMU-based pitch estimation using accelerometer + gyroscope
 
-Then add:
-
-```markdown
-## Hardware setup
-
-![Platform overview](docs/images/platform_overview.jpg)
-
-### IMU mounting
-![IMU mount](docs/images/imu_mount.jpg)
-
-### Calibration motion
-![Calibration motion](docs/images/calibration_motion.jpg)
-
-### Raw vs calibrated magnetometer
-![Raw vs calibrated magnetometer](docs/images/raw_vs_calibrated.png)
-
-### Heading error vs pitch
-![Heading error vs pitch](docs/images/heading_vs_pitch.png)
+Next phase:
+4. Full AHRS using Madgwick / xioTechnologies Fusion
 ```
 
 ---
 
-# 3. Hard-iron and soft-iron calibration
+# 1. Why normal magnetic heading changes with pitch
 
-An ideal 3-axis magnetometer rotated through many orientations should produce points on a sphere centered around the origin. Real robotic systems distort that field because of motors, wiring, batteries, structural material, nearby electronics, and sensor mounting.
+A conventional level heading is:
+
+\[
+\psi = \operatorname{atan2}(M_y, M_x)
+\]
+
+This assumes that the magnetic X/Y components are being interpreted in a suitable horizontal plane.
+
+When the sensor pitches, the Earth's magnetic field rotates relative to the sensor axes. Therefore the measured `Mx`, `My`, and `Mz` change even if the physical yaw is unchanged.
+
+So:
+
+```text
+same yaw + different pitch
+             ↓
+different magnetic projection
+             ↓
+different atan2(My, Mx)
+```
+
+Hard-iron and soft-iron calibration correct magnetic distortion, but they do not by themselves estimate 3D orientation.
+
+---
+
+# 2. 3D magnetometer calibration
+
+An ideal 3-axis magnetometer rotated through many orientations should form a sphere centered around the origin.
+
+In a real robot, the measurements are shifted and distorted by:
+
+- motors
+- permanent magnetic fields
+- wiring
+- power electronics
+- nearby ferromagnetic material
+- mechanical structure
+- sensor mounting
 
 We model the calibrated magnetic vector as:
 
 \[
-\boxed{m_{cal} = (m_{raw} - b)A}
+\boxed{
+m_{cal} = (m_{raw} - b)A
+}
 \]
 
 where:
 
-- `b` = hard-iron bias vector
-- `A` = soft-iron correction matrix
+- \(m_{raw}\) is the raw magnetometer vector
+- \(b\) is the hard-iron bias
+- \(A\) is the soft-iron correction matrix
 
-The experimental values from our robot were:
+## Calibration values obtained in our setup
+
+Hard-iron bias:
 
 ```python
 HARD_IRON_BIAS = [
@@ -124,7 +115,11 @@ HARD_IRON_BIAS = [
     -52.792277,
     -175.082933
 ]
+```
 
+Soft-iron matrix:
+
+```python
 SOFT_IRON_MATRIX = [
     [0.002010925,  0.000005664,  0.000191615],
     [0.000005664,  0.002092747, -0.000034360],
@@ -132,38 +127,42 @@ SOFT_IRON_MATRIX = [
 ]
 ```
 
-> **Do not reuse these numbers on another robot.** They are specific to our sensor, mounting, robot structure, and calibration environment.
-
-Runtime application:
+Application:
 
 ```python
 calibrated = (raw - HARD_IRON_BIAS) @ SOFT_IRON_MATRIX
 ```
 
+> These values are specific to the experimental robot and its magnetic environment. They should not be copied blindly to another platform.
+
 ---
 
-# 4. How the 3D calibration was calculated
+# 3. Ellipsoid fitting method
 
-We fitted an algebraic ellipsoid:
+The raw samples were fitted to the algebraic ellipsoid:
 
 \[
-ax^2 + by^2 + cz^2 + 2dxy + 2exz + 2fyz + gx + hy + iz = 1
+ax^2 + by^2 + cz^2
++ 2dxy + 2exz + 2fyz
++ gx + hy + iz = 1
 \]
 
-with the least-squares design matrix:
+The least-squares design matrix is:
 
 ```python
-D = np.column_stack((
-    x*x,
-    y*y,
-    z*z,
-    2*x*y,
-    2*x*z,
-    2*y*z,
-    x,
-    y,
-    z,
-))
+D = np.column_stack(
+    (
+        x*x,
+        y*y,
+        z*z,
+        2*x*y,
+        2*x*z,
+        2*y*z,
+        x,
+        y,
+        z,
+    )
+)
 
 parameters = np.linalg.lstsq(
     D,
@@ -177,8 +176,8 @@ The quadratic matrix is:
 \[
 Q =
 \begin{bmatrix}
-a & d & e\\
-d & b & f\\
+a & d & e \\
+d & b & f \\
 e & f & c
 \end{bmatrix}
 \]
@@ -188,94 +187,100 @@ and the linear vector is:
 \[
 q =
 \begin{bmatrix}
-g\\h\\i
+g \\
+h \\
+i
 \end{bmatrix}
 \]
 
-The ellipsoid center is:
+The fitted center is:
 
 \[
-\boxed{c = -\frac{1}{2}Q^{-1}q}
+\boxed{
+c = -\frac{1}{2}Q^{-1}q
+}
 \]
 
-After normalization, eigenvalue decomposition is used to derive the square-root transform that maps the ellipsoid approximately to a unit sphere.
+After normalization, the ellipsoid shape is decomposed as:
 
-A reusable implementation is included in:
+\[
+Q_s = V\Lambda V^T
+\]
 
-```text
-src/magnetometer_utils.py
-```
+and the square-root transform is used to map the ellipsoid approximately into a sphere:
+
+\[
+A = V\sqrt{\Lambda}V^T
+\]
+
+The complete reusable implementation is in [`src/calibration.py`](src/calibration.py).
 
 ---
 
-# 5. Calibration quality
+# 4. Calibration quality
 
-Our dataset contained `7869` magnetometer samples.
+The calibration dataset contained:
+
+```text
+7869 samples
+```
 
 Before calibration:
 
 | Metric | Result |
 |---|---:|
-| Mean magnitude deviation | 13.324% |
-| RMS magnitude deviation | 16.562% |
-| Maximum deviation | 40.933% |
+| Mean magnitude deviation | `13.324%` |
+| RMS magnitude deviation | `16.562%` |
+| Maximum magnitude deviation | `40.933%` |
 
 After calibration:
 
 | Metric | Result |
 |---|---:|
-| Mean magnitude deviation | 0.976% |
-| RMS magnitude deviation | 1.286% |
-| Mean calibrated magnitude | 0.999513 |
-| Standard deviation | 0.012852 |
+| Mean magnitude deviation | `0.976%` |
+| RMS magnitude deviation | `1.286%` |
+| Mean calibrated magnitude | `0.999513` |
+| Standard deviation | `0.012852` |
 
-The ellipsoid was transformed very close to a sphere, but that still did **not** guarantee tilt-independent heading.
+The ellipsoid was therefore transformed very close to a sphere.
 
----
-
-# 6. Why heading still changes with pitch
-
-The basic magnetic heading is:
-
-\[
-\psi = \operatorname{atan2}(M_y,M_x)
-\]
-
-When the sensor pitches, the Earth's magnetic vector rotates relative to the sensor X/Y plane. Therefore:
-
-```text
-same physical yaw
-+
-different sensor pitch
-=
-different X/Y magnetic projection
-```
-
-Hard/soft-iron calibration corrects magnetic distortion. It does not estimate the complete 3D orientation of the sensor.
+The important observation was that **good magnetic calibration did not eliminate pitch-induced heading error**.
 
 ---
 
-# 7. Magnetometer-only correction idea
+# 5. Approaches evaluated
 
-We wanted to see how much pitch-related error could be corrected **without using a pitch encoder at runtime**.
+## Approach 1 — Magnetometer-state lookup table
 
-First calculate the calibrated magnetic heading:
+The first compensation method was intentionally magnetometer-only.
 
-```python
-heading = (
-    np.degrees(np.arctan2(my, mx))
-    % 360.0
-)
-```
+After calibration, we calculate:
 
-Then calculate magnetic-vector elevation:
+### Base heading
 
 \[
-\alpha_m = \operatorname{atan2}\left(M_z,\sqrt{M_x^2+M_y^2}\right)
+\psi_m = \operatorname{atan2}(M_y, M_x)
 \]
 
 ```python
-mag_tilt = np.degrees(
+heading = np.degrees(
+    np.arctan2(my, mx)
+) % 360.0
+```
+
+### Magnetic-vector elevation
+
+\[
+\alpha_m =
+\operatorname{atan2}
+\left(
+M_z,
+\sqrt{M_x^2 + M_y^2}
+\right)
+\]
+
+```python
+mag_elevation = np.degrees(
     np.arctan2(
         mz,
         np.sqrt(mx*mx + my*my)
@@ -283,23 +288,28 @@ mag_tilt = np.degrees(
 )
 ```
 
-`mag_tilt` is **not mechanical pitch**. It is the elevation angle of the calibrated magnetic-field vector in the sensor frame.
+`mag_elevation` is **not mechanical pitch**. It is the elevation of the measured magnetic-field vector in the sensor frame.
 
-The LUT therefore maps:
+The empirical state was therefore:
 
 ```text
-(calibrated magnetic heading, magnetic-vector elevation)
-                         ↓
-                  heading correction
+(
+    calibrated magnetic heading,
+    magnetic-vector elevation
+)
 ```
 
----
+and the LUT stores:
 
-# 8. Circular angle math
+```text
+magnetic state → heading correction
+```
 
-Angles cannot be treated as ordinary scalar values around the `0° / 360°` boundary.
+The first LUT used approximately `5° × 5°` bins and contained `851` populated cells.
 
-Use:
+### Circular correction
+
+Angles must be compared circularly:
 
 ```python
 def angle_difference(target_deg, measured_deg):
@@ -313,234 +323,338 @@ def angle_difference(target_deg, measured_deg):
     ) - 180.0
 ```
 
-Example:
+This correctly handles cases such as:
 
 ```text
-target   = 2°
+target   =   2°
 measured = 358°
-result   = +4°
+
+correction = +4°
 ```
 
----
+instead of `-356°`.
 
-# 9. Improved LUT training method
+### Result
 
-Our first LUT used another compass as a temporary heading reference. That proved the concept, but it could introduce mounting offset, reference calibration error, magnetic disturbance, and timing mismatch while yaw was moving.
+The LUT removed a substantial part of the pitch-dependent error.
 
-The preferred target is now:
+Representative measurements:
 
-\[
-\boxed{Correction = ActualYaw - MeasuredHeading}
-\]
-
-with circular wrapping.
-
-Example:
-
-```text
-Actual yaw     = 90°
-Measured       = 111.14°
-Correction     = -21.14°
-```
-
-and:
-
-```text
-Actual yaw     = 270°
-Measured       = 247.20°
-Correction     = +22.80°
-```
-
----
-
-# 10. Recommended ground-truth dataset
-
-Use stationary measurements at:
-
-```text
-Yaw:
-0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°
-
-Pitch:
--40°, -30°, -20°, -10°, 0°,
-+10°, +20°, +30°, +40°
-```
-
-This gives `8 × 9 = 72` poses.
-
-At every pose:
-
-1. move to the desired yaw/pitch;
-2. stop the platform;
-3. wait for vibration to settle;
-4. record 50–100 magnetometer samples;
-5. calibrate every sample;
-6. compute magnetic heading and magnetic elevation;
-7. compute correction from known physical yaw;
-8. aggregate the samples into the LUT.
-
-A suggested CSV format is:
-
-```csv
-timestamp_us,mag_x,mag_y,mag_z,current_pitch,actual_yaw
-1000000,120,-65,-401,40,90
-1004545,122,-64,-399,40,90
-```
-
----
-
-# 11. Training algorithm
-
-```text
-FOR every known calibration pose:
-
-    Set physical yaw = Y_true
-    Set physical pitch = P
-
-    Wait until stationary
-
-    Collect N magnetometer samples
-
-    FOR each sample:
-
-        raw = [Mx, My, Mz]
-
-        calibrated =
-            (raw - HARD_IRON_BIAS)
-            @ SOFT_IRON_MATRIX
-
-        heading =
-            atan2(calibrated_y, calibrated_x)
-
-        mag_elevation =
-            atan2(
-                calibrated_z,
-                sqrt(
-                    calibrated_x²
-                    + calibrated_y²
-                )
-            )
-
-        correction =
-            circular_difference(
-                Y_true,
-                heading
-            )
-
-        Store:
-            heading
-            mag_elevation
-            correction
-
-Aggregate / bin samples
-Save LUT
-```
-
----
-
-# 12. Runtime algorithm
-
-```text
-Raw Mx My Mz
-     ↓
-Subtract hard-iron bias
-     ↓
-Apply soft-iron matrix
-     ↓
-Calibrated Mx My Mz
-     ↓
-Base magnetic heading
-     +
-Magnetic-vector elevation
-     ↓
-Find nearest reliable LUT cell
-     ↓
-Apply correction
-     ↓
-Wrap to 0°–360°
-     ↓
-Final heading
-```
-
----
-
-# 13. Experimental results
-
-Representative live tests:
-
-| Actual yaw | Pitch | Before LUT | After LUT |
+| Actual yaw | Pitch | Before | After LUT |
 |---:|---:|---:|---:|
 | 45° | +40° | 80° | 47° |
 | 45° | 0° | 44° | 45° |
 | 45° | -40° | 37° | 43° |
 | 90° | +40° | 111° | 97° |
-| 90° | 0° | 89° | 86° |
 | 90° | -40° | 70° | 88° |
 | 135° | -40° | 105° | 135° |
 | 270° | +40° | 247° | 260° |
 | 270° | 0° | 267° | 270° |
 | 270° | -40° | 285° | 268° |
 
-Across one small validation set, the mean absolute error decreased by roughly **75%**.
+Across one small validation set, the mean absolute error dropped by roughly **75%**.
 
-This is an experimental result, not a guaranteed accuracy specification.
+### Lookup strategy
+
+A nearest populated cell performed better than a naive four-neighbor inverse-distance interpolation in our tests.
+
+The interpolation could blend together nearby but meaningfully different correction states.
+
+The current implementation therefore keeps the simple nearest-state method.
 
 ---
 
-# 14. Nearest-cell vs interpolation
+## Approach 2 — Pitch encoder compensation
 
-We tested a four-neighbor inverse-distance interpolation. It did not consistently improve the result.
+The second approach used the known mechanical pitch angle from the platform encoder.
+
+For a pitch rotation about the sensor Y axis, a common tilt-compensation form is:
+
+\[
+X_h = M_x\cos\theta + sM_z\sin\theta
+\]
+
+\[
+Y_h = M_y
+\]
+
+where:
+
+- \(\theta\) is the measured platform pitch
+- \(s\) depends on the sensor-axis/sign convention
+
+The compensated heading is then:
+
+\[
+\psi =
+\operatorname{atan2}(Y_h, X_h)
+\]
+
+This approach has an important advantage:
+
+> the tilt angle is directly measured.
+
+It was useful for understanding whether the remaining heading error was genuinely related to pitch geometry.
+
+However, it also introduces a system dependency:
+
+```text
+magnetometer heading
++
+encoder zero
++
+encoder sign
++
+mechanical alignment
+```
+
+Any offset between the encoder frame and magnetometer frame appears directly in the heading.
+
+The project goal was to obtain a heading solution that could operate from the IMU itself, so the encoder-based method was treated as a useful experimental reference rather than the final architecture.
+
+---
+
+## Approach 3 — Accelerometer + gyroscope pitch estimation
+
+The third approach removed the mechanical pitch dependency and estimated pitch from the IMU.
+
+### Accelerometer pitch
+
+When linear acceleration is low, gravity provides an absolute tilt reference:
+
+\[
+\theta_{acc}
+=
+\operatorname{atan2}
+\left(
+a_x,
+\sqrt{a_y^2+a_z^2}
+\right)
+\]
+
+```python
+pitch_acc = np.degrees(
+    np.arctan2(
+        ax,
+        np.sqrt(ay*ay + az*az)
+    )
+)
+```
+
+### Gyroscope integration
+
+The gyroscope tracks short-term angular motion:
+
+\[
+\theta_{gyro,k}
+=
+\theta_{k-1}
++
+\omega_y\Delta t
+\]
+
+where the time interval is calculated from the sensor timestamp:
+
+\[
+\Delta t =
+\frac{t_k-t_{k-1}}{10^6}
+\]
+
+### Complementary filter
+
+The two estimates were fused using:
+
+\[
+\boxed{
+\theta_k
+=
+\alpha\theta_{gyro,k}
++
+(1-\alpha)\theta_{acc,k}
+}
+\]
+
+with:
+
+```python
+alpha = 0.98
+```
+
+This combines:
+
+```text
+Gyroscope:
+fast response, good during motion, but drifts
+
+Accelerometer:
+absolute gravity reference, but noisy under acceleration
+```
+
+The pitch sign and direction were validated experimentally on the platform.
+
+This approach demonstrated that the system can estimate the platform's tilt without relying on the mechanical encoder.
+
+It also naturally leads to the next stage: estimating the complete 3D attitude instead of estimating pitch separately.
+
+---
+
+# 6. Why the reference compass was removed from the final LUT concept
+
+During the first LUT experiment, another compass was used as the heading reference.
+
+A constant orientation offset can be removed mathematically, but a second compass can still introduce:
+
+- its own calibration error
+- magnetic disturbance
+- mounting misalignment
+- timestamp mismatch
+
+This matters particularly when yaw is changing.
+
+The cleaner LUT training target is therefore known physical yaw:
+
+\[
+\boxed{
+Correction =
+ActualYaw - MeasuredHeading
+}
+\]
+
+using circular angle subtraction.
 
 Example:
 
 ```text
-Actual yaw = 135°
-Pitch      = -40°
+Actual yaw = 90°
+Measured   = 111.14°
 
-Nearest-cell LUT: ~135°
-Interpolated LUT: ~128°
+Required correction = -21.14°
 ```
 
-For the current prototype, we therefore use the **nearest populated LUT cell**. A cleaner and denser ground-truth dataset may make interpolation useful later.
+and:
+
+```text
+Actual yaw = 270°
+Measured   = 247.20°
+
+Required correction = +22.80°
+```
 
 ---
 
-# 15. Getting started
+# 7. LUT training algorithm
 
-Clone the repository:
+A repeatable calibration can use a yaw/pitch grid such as:
 
-```bash
-git clone https://github.com/YOUR_USERNAME/tilt-compensated-magnetometer-heading.git
-cd tilt-compensated-magnetometer-heading
+```text
+Yaw:
+0, 45, 90, 135, 180, 225, 270, 315 degrees
+
+Pitch:
+-40, -30, -20, -10, 0, +10, +20, +30, +40 degrees
 ```
 
-Create an environment:
+At each stationary pose:
+
+```text
+1. Collect raw magnetometer samples
+
+2. Apply 3D calibration:
+       m_cal = (m_raw - bias) @ matrix
+
+3. Calculate:
+       magnetic heading
+       magnetic-vector elevation
+
+4. Calculate:
+       correction = circular_difference(
+           actual_yaw,
+           magnetic_heading
+       )
+
+5. Bin the magnetic state
+
+6. Calculate a circular mean correction for each populated bin
+
+7. Save the LUT
+```
+
+A script implementing this process is included as:
+
+[`scripts/build_lut.py`](scripts/build_lut.py)
+
+---
+
+# 8. Runtime algorithm
+
+```mermaid
+flowchart TD
+    A[Raw Mx My Mz] --> B[Subtract hard-iron bias]
+    B --> C[Apply soft-iron matrix]
+    C --> D[Calibrated Mx My Mz]
+    D --> E[atan2 My Mx]
+    D --> F[Magnetic-vector elevation]
+    E --> G[Nearest LUT state]
+    F --> G
+    G --> H[Apply correction]
+    H --> I[Wrap heading to 0-360 deg]
+```
+
+Equivalent pseudocode:
+
+```text
+raw = [Mx, My, Mz]
+
+calibrated =
+    (raw - hard_iron_bias)
+    @ soft_iron_matrix
+
+heading =
+    atan2(
+        calibrated_y,
+        calibrated_x
+    )
+
+mag_elevation =
+    atan2(
+        calibrated_z,
+        sqrt(
+            calibrated_x²
+            + calibrated_y²
+        )
+    )
+
+correction =
+    nearest_LUT(
+        heading,
+        mag_elevation
+    )
+
+final_heading =
+    wrap360(
+        heading
+        + correction
+    )
+```
+
+---
+
+# 9. Python usage
+
+Install:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-```
-
-Install dependencies:
-
-```bash
 pip install -r requirements.txt
 ```
 
-Run the example from the repository root:
-
-```bash
-python3 examples/quick_start.py
-```
-
----
-
-# 16. Minimal Python usage
+Minimal example:
 
 ```python
 import numpy as np
 
-from src.magnetometer_utils import (
+from src.heading import (
     apply_calibration,
     magnetic_heading_deg,
     magnetic_elevation_deg,
@@ -552,57 +666,78 @@ raw = np.array([
     mag_z,
 ])
 
-cal = apply_calibration(raw)
+calibrated = apply_calibration(raw)
 
-heading = magnetic_heading_deg(cal)
-mag_elevation = magnetic_elevation_deg(cal)
+heading = magnetic_heading_deg(calibrated)
+mag_elevation = magnetic_elevation_deg(calibrated)
 
 print(f"Heading: {heading:.2f} deg")
 print(f"Magnetic elevation: {mag_elevation:.2f} deg")
 ```
 
+Run:
+
+```bash
+python3 examples/quick_start.py
+```
+
 ---
 
-# 17. Fit your own calibration
+# 10. Fit a new magnetometer
 
-Never reuse another robot's hard/soft-iron values.
-
-Prepare a CSV:
+Expected CSV:
 
 ```csv
 mag_x,mag_y,mag_z
-125,-80,-410
-127,-77,-405
+131,-54,-403
+129,-51,-399
+...
 ```
 
-Then:
+Run:
 
-```python
-import numpy as np
-
-from src.magnetometer_utils import fit_ellipsoid_calibration
-
-samples = np.loadtxt(
-    "data/your_mag_samples.csv",
-    delimiter=",",
-    skiprows=1,
-    usecols=(0, 1, 2),
-)
-
-bias, matrix = fit_ellipsoid_calibration(samples)
-
-print("Bias:")
-print(bias)
-
-print("Correction matrix:")
-print(matrix)
+```bash
+python3 scripts/fit_calibration.py data/magnetometer_samples.csv
 ```
 
-For a good 3D fit, move the sensor through as much orientation space as the mechanism safely allows.
+The script reports:
+
+```text
+Hard-iron bias
+Soft-iron matrix
+Calibration magnitude statistics
+```
 
 ---
 
-# 18. Repository structure
+# 11. Build a known-yaw correction LUT
+
+Expected CSV:
+
+```csv
+mag_x,mag_y,mag_z,current_pitch,actual_yaw
+...
+```
+
+Build:
+
+```bash
+python3 scripts/build_lut.py \
+    data/known_yaw_dataset.csv \
+    magstate_lut.json
+```
+
+The generated JSON maps:
+
+```text
+"heading_bin,mag_elevation_bin"
+```
+
+to a signed heading correction in degrees.
+
+---
+
+# 12. Repository structure
 
 ```text
 tilt-compensated-magnetometer-heading/
@@ -612,104 +747,170 @@ tilt-compensated-magnetometer-heading/
 │
 ├── src/
 │   ├── __init__.py
-│   └── magnetometer_utils.py
+│   ├── calibration.py
+│   └── heading.py
+│
+├── scripts/
+│   ├── fit_calibration.py
+│   └── build_lut.py
 │
 ├── examples/
 │   └── quick_start.py
 │
-├── data/
-│   └── README.md
+├── docs/
+│   └── ALGORITHM.md
 │
-└── docs/
-    └── images/
-        └── .gitkeep
-```
-
-Later we can add:
-
-```text
-scripts/
-    fit_calibration.py
-    build_lut.py
-    live_heading.py
-
-plots/
-    raw_ellipsoid.png
-    calibrated_sphere.png
-    heading_error_vs_pitch.png
-
-docs/
-    calibration_math.md
-    experiment_protocol.md
-    ahrs_comparison.md
+└── data/
+    └── README.md
 ```
 
 ---
 
-# 19. Limitations
+# 13. Next phase — full AHRS
 
-This project currently demonstrates an empirical, robot-specific correction.
-
-Important limitations include:
-
-- magnetic interference may change after hardware changes;
-- motor current can generate non-static magnetic fields;
-- another environment may have a different local magnetic field;
-- the LUT should not be extrapolated blindly outside its training state space;
-- rapid motion is better handled with gyro/accelerometer fusion;
-- calibration constants are not transferable between robots.
-
----
-
-# 20. Next phase: AHRS
-
-The longer-term comparison is:
+The compensation experiments showed the progression clearly:
 
 ```text
-Gyroscope
-    +
-Accelerometer
-    +
-Calibrated magnetometer
-    ↓
-Madgwick / Mahony / Fusion
-    ↓
-Quaternion
-    ↓
-Roll / Pitch / Yaw
-    ↓
-Tilt-compensated heading
+Magnetometer only
+       ↓
+Magnetometer + encoder pitch
+       ↓
+Magnetometer + IMU-estimated pitch
+       ↓
+Full 3D sensor fusion
 ```
 
-The UART timestamp can be used to compute the real integration interval:
+The next architecture is a 9-DoF AHRS:
+
+```mermaid
+flowchart TD
+    G[Gyroscope] --> A[AHRS]
+    AC[Accelerometer] --> A
+    M[Calibrated Magnetometer] --> A
+    A --> Q[Quaternion]
+    Q --> R[Roll / Pitch / Yaw]
+    R --> H[Tilt-Compensated Heading]
+```
+
+Two implementations are of particular interest:
+
+### Madgwick AHRS
+
+Madgwick combines:
+
+```text
+gyroscope
++
+accelerometer
++
+magnetometer
+```
+
+to estimate a quaternion representing the sensor orientation.
+
+### xioTechnologies Fusion
+
+Fusion provides a mature AHRS implementation with additional rejection and bias-handling logic that is useful on moving robotic systems.
+
+The UART timestamps can be used directly for the AHRS integration interval:
 
 \[
-\Delta t = \frac{t_k - t_{k-1}}{10^6}
+\Delta t =
+\frac{t_k-t_{k-1}}{10^6}
 \]
 
-This avoids assuming a perfectly fixed update interval.
+The intended final pipeline is:
+
+```text
+Gyro raw
+  ↓
+scale + bias correction
+  ┐
+  │
+Accel raw
+  ↓
+scale / normalization
+  ├──> AHRS ──> Quaternion ──> Yaw ──> Heading
+  │
+Mag raw
+  ↓
+3D hard/soft-iron calibration
+  ┘
+```
 
 ---
 
-# Key lessons
+# 14. Engineering observations
 
-- A good ellipsoid fit does **not** guarantee good heading while tilted.
-- Hard/soft-iron calibration and tilt compensation solve different problems.
-- Known physical yaw is preferable to another unsynchronized compass for LUT ground truth.
-- Angle differences and means must use circular math.
-- Calibrate the **complete robot configuration**, not just the loose sensor.
-- Validate on data that was not used to build the correction.
+### Calibration quality and heading quality are different metrics
+
+A nearly spherical calibrated point cloud does not guarantee correct heading under tilt.
+
+### Magnetometer-only compensation can work well in constrained motion
+
+For a system with fixed roll and bounded pitch, the calibrated magnetic vector can contain useful orientation-dependent structure.
+
+### Encoder compensation is valuable as a reference
+
+It provides a direct known tilt measurement and helps separate magnetic calibration problems from geometric tilt problems.
+
+### Accelerometer and gyroscope remove the encoder dependency
+
+The accelerometer provides a gravity reference while the gyro tracks motion between gravity corrections.
+
+### Full AHRS is the natural final architecture
+
+Once gyro, accelerometer, and calibrated magnetometer data are available, estimating the complete orientation is more general than applying an independent pitch correction.
+
+### Ground truth matters
+
+A correction model is only as reliable as the heading reference used to train and validate it.
+
+### Angle math must be circular
+
+All angle differences and averages should respect wraparound at `0° / 360°`.
 
 ---
 
-# Contributing
+# 15. Scope and limitations
 
-If you test this approach on another robotic platform, useful contributions include calibration datasets, before/after plots, interpolation experiments, AHRS comparisons, sensor-frame examples, and magnetic-interference tests.
+The LUT approach is empirical and robot-specific.
 
-When sharing results, document the sensor model, mounting arrangement, calibration procedure, physical-yaw reference, and test conditions.
+Its performance can change with:
+
+- magnetic environment
+- motor current
+- wiring changes
+- sensor relocation
+- added ferromagnetic material
+- operation outside the trained orientation range
+
+The included calibration constants represent one experimental installation.
+
+This repository should therefore be treated as a reproducible engineering method rather than a universal set of calibration numbers.
 
 ---
 
-# Disclaimer
+## Summary
 
-This repository documents an experimental engineering workflow. Do not assume the included calibration constants are valid for another sensor or robot. For navigation or safety-critical systems, validate the estimator under the actual operating conditions.
+The project started with a calibrated magnetometer whose heading still changed by tens of degrees as the platform pitched.
+
+The investigation progressed through:
+
+```text
+3D magnetic calibration
+        ↓
+magnetometer-state LUT
+        ↓
+encoder-based tilt compensation
+        ↓
+accelerometer + gyro pitch estimation
+        ↓
+full AHRS direction
+```
+
+The key result is that **hard/soft-iron calibration and tilt compensation are separate problems**.
+
+The LUT experiments demonstrated a large reduction in pitch-related heading error, while the encoder and IMU experiments clarified how physical tilt can be incorporated explicitly.
+
+The next stage uses the same calibrated magnetic vector together with accelerometer and gyroscope measurements in Madgwick/xioTechnologies Fusion to estimate the complete 3D attitude and obtain continuous tilt-compensated heading.
